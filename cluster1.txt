@@ -1,0 +1,266 @@
+gcloud container clusters create cc-4-c \
+  --machine-type n1-standard-1 \
+  --num-nodes 3 \
+  --zone europe-west3-c \
+  --cluster-version latest
+
+# Instalation of kubectl from gcloud
+gcloud components install kubectl
+gcloud container clusters get-credentials cc-4-c --zone europe-west3-c
+
+#Flink
+#Creating one jobmanager & 3 taskmanger instances to execute code on Flink
+kubectl apply -f flink-configuration-configmap.yaml
+kubectl apply -f jobmanager-service.yaml
+kubectl apply -f jobmanager-deployment.yaml
+kubectl apply -f taskmanager-deployment.yaml
+
+#Hdfs
+#HDFS did not work issue in loading module, tried different filesystem plugins; finally thought of using Minio as S3 storage
+#A hdfs cluster setup is listed here but not used
+
+############ Not Used
+##Installation of hadoop on cluster via helm
+# helm install cc-hadoop \
+#   stable/hadoop
+##Uploading files to hdfs
+# kubectl cp tolstoy-war-and-peace.txt cc-hadoop-hadoop-hdfs-nn-0:/tmp/tolstoy-war-and-peace.txt
+# kubectl exec -it cc-hadoop-hadoop-hdfs-nn-0 -- /usr/local/hadoop/bin/hdfs dfs -moveFromLocal /tmp/tolstoy-war-and-peace.txt /tolstoy-war-and-peace.txt
+## Downloading the result from hdfs
+# kubectl exec -it cc-hadoop-hadoop-hdfs-nn-0 -- /usr/local/hadoop/bin/hdfs dfs -copyToLocal /WordCountResults.txt /tmp/WordCountResults.txt
+# kubectl cp cc-hadoop-hadoop-hdfs-nn-0:/tmp/WordCountResults.txt WordCountResults.txt
+############
+
+############ Used Code
+# Setup Minio for S3 storage
+kubectl apply -f minio-deployment.yaml
+
+# Listing all pods
+kubectl get pods
+
+# Forward minio
+kubectl port-forward service/minio-service 9000:9000 &
+ 
+# Copy source file to S3
+# Upload and start jar
+kubectl cp -r WordCount.jar flink-jobmanager-6494d96b44-gscj5:/tmp/WordCount.jar
+kubectl exec -itd flink-jobmanager-6494d96b44-gscj5 -- flink run -m localhost:8081 "/tmp/WordCount.jar" --output "s3://flink/WordCountResults.txt"  --input "s3://flink/tolstoy-war-and-peace.txt"
+
+# Forward flink webinterface
+kubectl port-forward service/flink-jobmanager 8081:8081
+
+## Upload file to S3
+bucket=flink
+file=tolstoy-war-and-peace.txt
+host=localhost:9000
+s3_key='minio'
+s3_secret='minio123'
+
+resource = "/${bucket}/${file}"
+content_type = "application/octet-stream"
+date = `date -R`
+_signature = "PUT\n\n${content_type}\n${date}\n${resource}"
+signature = `echo -en ${_signature} | openssl sha1 -hmac ${s3_secret} -binary | base64`
+
+curl -v -X PUT -T "${file}" \
+          -H "Host: $host" \
+          -H "Date: ${date}" \
+          -H "Content-Type: ${content_type}" \
+          -H "Authorization: AWS ${s3_key}:${signature}" \
+          http://$host${resource}
+
+## Download file from S3 (minio)
+bucket=flink
+file=WordCountResults.txt
+host=localhost:9000
+s3_key='minio'
+s3_secret='minio123'
+
+resource = "/${bucket}/${file}"
+content_type  = "application/octet-stream"
+date=`date -R`
+_signature = "GET\n\n${content_type}\n${date}\n${resource}"
+signature = `echo -en ${_signature} | openssl sha1 -hmac ${s3_secret} -binary | base64`
+
+curl -v -o "${file}" \
+          -H "Host: $host" \
+          -H "Date: ${date}" \
+          -H "Content-Type: ${content_type}" \
+          -H "Authorization: AWS ${s3_key}:${signature}" \
+          http://$host${resource}
+
+## Kubernetes Configuration files
+# flink-configuration-configmap.yaml
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flink-config
+  labels:
+    app: flink
+data:
+  flink-conf.yaml: |+
+    jobmanager.rpc.address: flink-jobmanager
+    taskmanager.numberOfTaskSlots: 1
+    blob.server.port: 6124
+    jobmanager.rpc.port: 6123
+    taskmanager.rpc.port: 6122
+    jobmanager.heap.size: 1024m
+    taskmanager.heap.size: 1024m
+    s3.access-key: minio
+    s3.secret-key: minio123
+    s3.endpoint: http://minio-service:9000
+    s3.path.style.access: true
+    s3.path-style-access: true
+  log4j.properties: |+
+    log4j.rootLogger=INFO, file
+    log4j.logger.akka=INFO
+    log4j.logger.org.apache.kafka=INFO
+    log4j.logger.org.apache.hadoop=INFO
+    log4j.logger.org.apache.zookeeper=INFO
+    log4j.appender.file=org.apache.log4j.FileAppender
+    log4j.appender.file.file=${log.file}
+    log4j.appender.file.layout=org.apache.log4j.PatternLayout
+    log4j.appender.file.layout.ConversionPattern=%d{yyyy-MM-dd HH:mm:ss,SSS} %-5p %-60c %x - %m%n
+    log4j.logger.org.apache.flink.shaded.akka.org.jboss.netty.channel.DefaultChannelPipeline=ERROR, file
+
+
+# jobmanager-service.yaml
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flink-jobmanager
+spec:
+  type: ClusterIP
+  ports:
+  - name: rpc
+    port: 6123
+  - name: blob
+    port: 6124
+  - name: ui
+    port: 8081
+  selector:
+    app: flink
+    component: jobmanager
+
+
+# jobmanager-deployment.yaml
+---
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: flink-jobmanager
+spec:
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: flink
+        component: jobmanager
+    spec:
+      containers:
+      - name: jobmanager
+        image: flink:1.9.2
+        workingDir: /opt/flink
+        command: ["/bin/bash", "-c", " \
+          mkdir -p ./plugins/s3-fs-presto;
+          cp ./opt/flink-s3-fs-presto-1.9.2.jar ./plugins/s3-fs-presto/;
+          $FLINK_HOME/bin/jobmanager.sh start;
+          while :;
+          do
+            if [[ -f $(find log -name '*jobmanager*.log' -print -quit) ]];
+              then tail -f -n +1 log/*jobmanager*.log;
+            fi;
+          done", 
+          "export HADOOP_CLASSPATH=hadoop classpath"]
+        ports:
+        - containerPort: 6123
+          name: rpc
+        - containerPort: 6124
+          name: blob
+        - containerPort: 8081
+          name: ui
+        livenessProbe:
+          tcpSocket:
+            port: 6123
+          initialDelaySeconds: 40
+          periodSeconds: 60
+        volumeMounts:
+        - name: flink-config-volume
+          mountPath: /opt/flink/conf
+      volumes:
+      - name: flink-config-volume
+        configMap:
+          name: flink-config
+          items:
+          - key: flink-conf.yaml
+            path: flink-conf.yaml
+          - key: log4j.properties
+            path: log4j.properties
+
+
+# taskmanager-deployment.yaml
+---
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: flink-taskmanager
+spec:
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        app: flink
+        component: taskmanager
+    spec:
+      containers:
+      - name: taskmanager
+        image: flink:1.9.2
+        workingDir: /opt/flink
+        command: ["/bin/bash", "-c", " \
+          mkdir -p ./plugins/s3-fs-presto;
+          cp ./opt/flink-s3-fs-presto-1.9.2.jar ./plugins/s3-fs-presto/;
+          $FLINK_HOME/bin/taskmanager.sh start; 
+          while :;
+          do
+            if [[ -f $(find log -name '*taskmanager*.log' -print -quit) ]];
+              then tail -f -n +1 log/*taskmanager*.log;
+            fi;
+          done",
+          "export HADOOP_CLASSPATH=hadoop classpath"]
+        ports:
+        - containerPort: 6122
+          name: rpc
+        livenessProbe:
+          tcpSocket:
+            port: 6122
+          initialDelaySeconds: 30
+          periodSeconds: 60
+        volumeMounts:
+        - name: flink-config-volume
+          mountPath: /opt/flink/conf/
+      volumes:
+      - name: flink-config-volume
+        configMap:
+          name: flink-config
+          items:
+          - key: flink-conf.yaml
+            path: flink-conf.yaml
+          - key: log4j.properties
+            path: log4j.properties
+
+			
+			
+			
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+## Setup Hadoop
+Helm Setup
+wget https://get.helm.sh/helm-v3.0.3-linux-amd64.tar.gz
+tar -zxvf helm-v3.0.3-linux-amd64.tar.gz
+mv linux-amd64/helm /usr/local/bin/helm
+rm -rf helm*
+# Init helm
+helm init
+# Add helm stable repo
+helm repo add stable https://kubernetes-charts.storage.googleapis.com

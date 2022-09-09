@@ -1,0 +1,9 @@
+Which steps in your program require communication and synchronization between your workers?
+-- workers need to communicate with each other to exchange data, get output from other workers, etc. for that reason, communication and synchronization is required during process of sorting map values, and count the number of each word. Sorting hashmap values requiring knowledge of all values in different workers; while count the word number is realised using collector, which accumulate elements with same hashmap value into same steam, which require the communication between workers.
+
+What resources is the job bound by? Memory? CPU? Network? Disk?
+-- the bottleneck is determined by the resources available. Since each work will process the data in parallel, CPU would be a bound for job performance if the program is computing intensive. If the program is data intensive, that the input is a very large file, in order to realise sorting function, data should be loaded into main memory, and memory may become the bottleneck. Lastly, if there are a lot of clusters, and they need to communicate, combining with overhead of starting a cluster for each job and jobs are short-lived, network could be the bound.   
+
+
+Could you improve the partitioning of your data to yield better runtime?
+-- Yes. Although most of the jobs are done in each worker in parallel, there are some steps need communication, so the bottleneck for runtime is the longest time taken among workers, and the time needed for processing the outcome of workers. If the data is correctly partitioned, program could run more efficient.

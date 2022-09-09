@@ -1,0 +1,200 @@
+# Creating a kubernetes cluster to run flink
+gcloud container clusters create cc-4-c \
+  --machine-type n1-standard-1 \
+  --num-nodes 3 \
+  --zone us-central1-b \
+  --cluster-version latest 
+  
+# Set up flink on the cluster
+kubectl create -f flink-configuration-configmap.yaml
+kubectl create -f jobmanager-service.yaml
+kubectl create -f jobmanager-deployment.yaml
+kubectl create -f taskmanager-deployment.yaml
+
+kubectl create -f jobmanager-rest-service.yaml
+
+# Forwarding flink to localhost
+kubectl get pods
+kubectl port-forward pods/node1 8081:8081
+
+# Creating a google storage bucket and uploading required files
+gsutil mb -p cc-ws-19-assignment-1 gs://a4-bucket
+gsutil cp tolstoy-war-and-peace.txt gs://a4-bucket
+gsutil cp WordCountResults.txt gs://a4-bucket
+
+# Creating a hadoop cluster
+gcloud dataproc clusters create cc-4-d \
+  --master-machine-type n1-standard-1 \
+  --worker-machine-type n1-standard-1 \
+  --num-workers 3 \
+  --zone us-central1-b \
+  --bucket a4-bucket 
+
+
+flink run -m localhost:8081 "C:\Code\cc20\assignment4\target\WordCount.jar" --output "hdfs://35.223.18.61:50070/data/WordCountResults.txt"  --input "hdfs://35.223.18.61:50070/data/tolstoy-war-and-peace.txt"
+
+
+
+
+
+## Configuration files
+# flink-configuration-configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flink-config
+  labels:
+    app: flink
+data:
+  flink-conf.yaml: |+
+    jobmanager.rpc.address: flink-jobmanager
+    taskmanager.numberOfTaskSlots: 1
+    blob.server.port: 6124
+    jobmanager.rpc.port: 6123
+    taskmanager.rpc.port: 6122
+    jobmanager.heap.size: 1024m
+    taskmanager.heap.size: 1024m
+  log4j.properties: |+
+    log4j.rootLogger=INFO, file
+    log4j.logger.akka=INFO
+    log4j.logger.org.apache.kafka=INFO
+    log4j.logger.org.apache.hadoop=INFO
+    log4j.logger.org.apache.zookeeper=INFO
+    log4j.appender.file=org.apache.log4j.FileAppender
+    log4j.appender.file.file=${log.file}
+    log4j.appender.file.layout=org.apache.log4j.PatternLayout
+    log4j.appender.file.layout.ConversionPattern=%d{yyyy-MM-dd HH:mm:ss,SSS} %-5p %-60c %x - %m%n
+    log4j.logger.org.apache.flink.shaded.akka.org.jboss.netty.channel.DefaultChannelPipeline=ERROR, file
+
+
+# jobmanager-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: flink-jobmanager
+spec:
+  type: ClusterIP
+  ports:
+  - name: rpc
+    port: 6123
+  - name: blob
+    port: 6124
+  - name: ui
+    port: 8081
+  selector:
+    app: flink
+    component: jobmanager
+
+
+# jobmanager-deployment.yaml
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: flink-jobmanager
+spec:
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: flink
+        component: jobmanager
+    spec:
+      containers:
+      - name: jobmanager
+        image: flink:latest
+        workingDir: /opt/flink
+        command: ["/bin/bash", "-c", "$FLINK_HOME/bin/jobmanager.sh start;\
+          while :;
+          do
+            if [[ -f $(find log -name '*jobmanager*.log' -print -quit) ]];
+              then tail -f -n +1 log/*jobmanager*.log;
+            fi;
+          done", 
+          "export HADOOP_CLASSPATH=hadoop classpath"]
+        ports:
+        - containerPort: 6123
+          name: rpc
+        - containerPort: 6124
+          name: blob
+        - containerPort: 8081
+          name: ui
+        livenessProbe:
+          tcpSocket:
+            port: 6123
+          initialDelaySeconds: 30
+          periodSeconds: 60
+        volumeMounts:
+        - name: flink-config-volume
+          mountPath: /opt/flink/conf
+      volumes:
+      - name: flink-config-volume
+        configMap:
+          name: flink-config
+          items:
+          - key: flink-conf.yaml
+            path: flink-conf.yaml
+          - key: log4j.properties
+            path: log4j.properties
+
+
+# taskmanager-deployment.yaml
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: flink-taskmanager
+spec:
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        app: flink
+        component: taskmanager
+    spec:
+      containers:
+      - name: taskmanager
+        image: flink:latest
+        workingDir: /opt/flink
+        command: ["/bin/bash", "-c", "$FLINK_HOME/bin/taskmanager.sh start; \
+          while :;
+          do
+            if [[ -f $(find log -name '*taskmanager*.log' -print -quit) ]];
+              then tail -f -n +1 log/*taskmanager*.log;
+            fi;
+          done",
+          "export HADOOP_CLASSPATH=hadoop classpath"]
+        ports:
+        - containerPort: 6122
+          name: rpc
+        livenessProbe:
+          tcpSocket:
+            port: 6122
+          initialDelaySeconds: 30
+          periodSeconds: 60
+        volumeMounts:
+        - name: flink-config-volume
+          mountPath: /opt/flink/conf/
+      volumes:
+      - name: flink-config-volume
+        configMap:
+          name: flink-config
+          items:
+          - key: flink-conf.yaml
+            path: flink-conf.yaml
+          - key: log4j.properties
+            path: log4j.properties
+
+
+# jobmanager-rest-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: flink-jobmanager-rest
+spec:
+  type: NodePort
+  ports:
+  - name: rest
+    port: 8081
+    targetPort: 8081
+  selector:
+    app: flink
+    component: jobmanager
